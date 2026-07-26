@@ -1,3 +1,26 @@
+//-----------------------------------------------------------------
+// PC-Tracer2.cpp
+//
+// Elaborates a trace produced by biriscv_pc_tracer2.v into a call
+// stack history, in the same spirit as the original PC-Tracer.cpp
+// but driven by *explicit* control-flow classification instead of
+// PC-range guessing:
+//
+//   - CALL   : JAL/JALR that writes ra (x1)             -> push
+//   - RETURN : JALR ra,0(ra)  (rs1==ra, rd==x0, imm==0)  -> pop
+//   - xRET   : MRET/SRET (matches biriscv INST_ERET)     -> pop
+//   - IRQ/EXC: an 'X' record from the tracer              -> push
+//              (matched by the following xRET)
+//   - anything else that lands in a different function
+//     than the current top of stack (e.g. a tail-jump)
+//     just relabels the current frame instead of pushing,
+//     since no return address was ever saved for it.
+//
+// Because push/pop are derived from real retiring instructions
+// (post branch-resolution, post flush), this is correct across
+// mispredicted returns and interrupts, which is exactly what broke
+// the original tool.
+//-----------------------------------------------------------------
 #include <iostream>
 #include <sstream>
 #include <iomanip>
@@ -11,313 +34,273 @@
 
 using namespace std;
 
-
-
-
-unsigned int hex2uint	(string inp)
+//-----------------------------------------------------------------
+// hex2uint: parse a hex string (no 0x prefix) -> unsigned int
+//-----------------------------------------------------------------
+static unsigned int hex2uint(const string &inp)
 {
     unsigned int tmp = 0;
-    bool ridi(false);
-    for (unsigned int i = 0; i < inp.size(); i++)
+    for (char c : inp)
     {
-        tmp = 16 * tmp;
-        switch (inp[i])
-        {
-        case '0':
-            break;
-        case '1':
-            tmp += 1;
-            break;
-        case '2':
-            tmp += 2;
-            break;
-        case '3':
-            tmp += 3;
-            break;
-        case '4':
-            tmp += 4;
-            break;
-        case '5':
-            tmp += 5;
-            break;
-        case '6':
-            tmp += 6;
-            break;
-        case '7':
-            tmp += 7;
-            break;
-        case '8':
-            tmp += 8;
-            break;
-        case '9':
-            tmp += 9;
-            break;
-        case 'a':
-        case 'A':
-            tmp += 10;
-            break;
-        case 'b':
-        case 'B':
-            tmp += 11;
-            break;
-        case 'c':
-        case 'C':
-            tmp += 12;
-            break;
-        case 'd':
-        case'D':
-            tmp += 13;
-            break;
-        case 'e':
-        case 'E':
-            tmp += 14;
-            break;
-        case 'f':
-        case 'F':
-            tmp += 15;
-            break;
-        default:
-            ridi = true;
-            break;
-        }
+        tmp <<= 4;
+        if (c >= '0' && c <= '9')      tmp += (c - '0');
+        else if (c >= 'a' && c <= 'f') tmp += (c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') tmp += (c - 'A' + 10);
     }
-    if (ridi)
-        cout << "ridi:\t" << inp << endl;
     return tmp;
 }
 
+//-----------------------------------------------------------------
+// Symbol table (built from an objdump-style "code.txt" listing,
+// same format as the original tool: lines like
+//   00000130 <main_entry>:
+//-----------------------------------------------------------------
 struct func_info
 {
-    std::string func_name;
-    unsigned int SOFunc;
-    unsigned int EOFunc;
+    string       func_name;
+    unsigned int SOFunc = 0;
+    unsigned int EOFunc = 0;
 };
 
-bool find_func			(const std::vector<func_info> &list, 
-						 unsigned int pc, 
-						 func_info &info)
+static bool find_func(const vector<func_info> &list, unsigned int pc, func_info &info)
 {
-    bool found(false);
     if (list.empty())
         return false;
-    for (long long i = static_cast<long long>(list.size()) - 1; i >= 0; i--)
+    for (long long i = (long long)list.size() - 1; i >= 0; i--)
     {
-        if (((int)pc >= (int)list[i].SOFunc) && ((int)pc <= (int)list[i].EOFunc))
+        if ((int)pc >= (int)list[i].SOFunc && (int)pc <= (int)list[i].EOFunc)
         {
             info = list[i];
-            found = true;
-            break;
+            return true;
         }
     }
-    return found;
+    return false;
 }
 
-bool is_interrupt_like	(const std::string &name)
+//-----------------------------------------------------------------
+// RISC-V field / opcode helpers (subset mirrored from
+// biriscv_defs.v - only what's needed to classify control flow)
+//-----------------------------------------------------------------
+static inline unsigned rd_of(uint32_t op)  { return (op >> 7)  & 0x1F; }
+static inline unsigned rs1_of(uint32_t op) { return (op >> 15) & 0x1F; }
+static inline int32_t  itype_imm(uint32_t op)
 {
-    return (name == "INT_VECTOR") ||
-           (name.rfind("EXT_INT_", 0) == 0) ||
-           (name.rfind("external_interrupt_signal_handler_", 0) == 0);
+    int32_t imm = (int32_t)op >> 20; // sign extended [31:20]
+    return imm;
 }
 
-void emit_stack_state	(std::ostream &out,
-                    	 const std::string &pc,
-                    	 const std::string &time,
-                    	 const std::vector<func_info> &stack)
+static const uint32_t INST_JAL        = 0x0000006f, INST_JAL_MASK        = 0x0000007f;
+static const uint32_t INST_JALR       = 0x00000067, INST_JALR_MASK       = 0x0000707f;
+static const uint32_t INST_ERET       = 0x00200073, INST_ERET_MASK       = 0xcfffffff; // mret/sret/uret
+
+static inline bool is_jal (uint32_t op) { return (op & INST_JAL_MASK)  == INST_JAL;  }
+static inline bool is_jalr(uint32_t op) { return (op & INST_JALR_MASK) == INST_JALR; }
+static inline bool is_eret(uint32_t op) { return (op & INST_ERET_MASK) == INST_ERET; }
+
+static inline bool is_call(uint32_t op)
 {
-    out << "(" << pc << " @ " << std::setw(8) << time << ")" << "\t\t";
-    for (std::size_t i = 1; i < stack.size(); ++i)
+    return (is_jal(op) || is_jalr(op)) && rd_of(op) == 1; // writes ra
+}
+static inline bool is_ret(uint32_t op)
+{
+    // jalr x0, 0(ra)
+    return is_jalr(op) && rs1_of(op) == 1 && rd_of(op) == 0 && itype_imm(op) == 0;
+}
+
+//-----------------------------------------------------------------
+// Call-stack frame
+//-----------------------------------------------------------------
+enum class FrameKind { ROOT, CALL, IRQ };
+
+struct Frame
+{
+    func_info info;
+    FrameKind kind = FrameKind::CALL;
+};
+
+static void emit_stack_state(ostream &out, const string &pc, const string &time,
+                              const vector<Frame> &stack)
+{
+    out << "(" << pc << " @ " << setw(8) << time << ")" << "\t\t";
+    for (size_t i = 1; i < stack.size(); ++i)
         out << "\t";
-    if (!stack.empty() && is_interrupt_like(stack.back().func_name))
+    if (!stack.empty() && stack.back().kind == FrameKind::IRQ)
         out << "[IRQ] ";
-    out << stack.back().func_name << '\n';
+    if (!stack.empty())
+        out << stack.back().info.func_name << '\n';
+    else
+        out << "<empty>\n";
 }
 
-int main(int argc, char** argv)
+int main(int argc, char **argv)
 {
     bool verbose(false);
-	std::filesystem::path				Path2Code	=	"";	
-	std::filesystem::path				Path2Loge	=	"";
-	std::filesystem::path				Path2Outp	=	"";
+    std::filesystem::path Path2Code = "";
+    std::filesystem::path Path2Loge = "";
+    std::filesystem::path Path2Outp = "";
 
-    
-	CLI::App app{"Assembly file to instruction memory file converter"};	
-	app.add_flag	("-v,--verbose,!--no-verbose",	verbose,	"Enable verbose output");
-	app.add_option	("-i,--input,--code-dir",		Path2Code,	"Path to code.txt");
-	app.add_option	("-l,--log",					Path2Loge,	"Path to log file");
-	app.add_option	("-o,--output,--out-dir",		Path2Outp,	"Output directory");
-	CLI11_PARSE(app, argc, argv);
+    CLI::App app{"biRISC-V retirement trace -> call stack elaborator (v2)"};
+    app.add_flag  ("-v,--verbose,!--no-verbose", verbose,   "Enable verbose output");
+    app.add_option("-i,--input,--code-dir",      Path2Code, "Path to code.txt (objdump listing)");
+    app.add_option("-l,--log",                   Path2Loge, "Path to PC_trac_log.log produced by biriscv_pc_tracer2");
+    app.add_option("-o,--output,--out-dir",      Path2Outp, "Output directory");
+    CLI11_PARSE(app, argc, argv);
 
-	
-    
+    std::filesystem::create_directory(Path2Outp);
 
-    string a_line;
-	std::filesystem::create_directory(Path2Outp);
-    ifstream code_fil;  code_fil.open(Path2Code);
-    ifstream trac_log;  trac_log.open(Path2Loge);
-    ofstream trac_vis;  trac_vis.open(Path2Outp / ("Trace.txt"));
-    ofstream Erro_fil;  Erro_fil.open(Path2Outp / ("Errors.txt"));
+    ifstream code_fil(Path2Code);
+    ifstream trac_log(Path2Loge);
+    ofstream trac_vis(Path2Outp / "Trace.txt");
+    ofstream Erro_fil(Path2Outp / "Errors.txt");
 
-
-    func_info info = { "INT_VECTOR", 0, 0 };
-    //int func_cntr(0);
-    std::vector<func_info> List;
-    smatch m;
-
-
-
-    cout << "Analizing text file ..." << endl;
-    cout << "Extarcting function info ..." << endl;
-    regex Code_pattern("^([0-9a-fA-F]{8}) <([0-9A-Za-z_]+)>:");
-    int cntr(0);
-    while (code_fil.is_open() && !code_fil.eof())
+    //---------------------------------------------------------
+    // 1) Parse symbol table (same as original tool)
+    //---------------------------------------------------------
+    vector<func_info> List;
     {
-        cntr++;
-        if (cntr % 100 == 0)
+        func_info info{"INT_VECTOR", 0, 0};
+        smatch m;
+        regex Code_pattern("^([0-9a-fA-F]{8}) <([0-9A-Za-z_]+)>:");
+        string a_line;
+        int cntr = 0;
+        cout << "Parsing symbol table..." << endl;
+        while (code_fil.is_open() && !code_fil.eof())
         {
-            cout << "\033[2K\r" << std::flush;
-            cout << "line #" << cntr;
-        }
-        getline(code_fil, a_line);
-        if (regex_search(a_line, m, Code_pattern))
-        {
-            unsigned int tmp = hex2uint(m.str(1));
-            bool modif(false);
-            if ((tmp % 8) != 0)
+            cntr++;
+            getline(code_fil, a_line);
+            if (regex_search(a_line, m, Code_pattern))
             {
-                modif = true;
-                tmp -= 4;
+                unsigned int tmp = hex2uint(m.str(1));
+                bool modif = false;
+                if ((tmp % 8) != 0) { modif = true; tmp -= 4; }
+                info.EOFunc = tmp - (!modif) * 8;
+                List.push_back(info);
+                info.func_name = m.str(2);
+                info.SOFunc = tmp;
             }
-            info.EOFunc = tmp - (!modif)*8;
-            List.push_back(info);
-            info.func_name = m.str(2);
-            info.SOFunc = tmp;
         }
-    }
-    info.EOFunc = 0X7FFFFFFC;
-    List.push_back(info);
-    cout << "\033[2K\r" << std::flush;
-    cout << "line #" << cntr << endl;
-    cout << "Analizing text file is done!" << endl << endl;
-    code_fil.close();
-
-    if (verbose)
-    {
-        for (unsigned int i = 0; i < List.size(); i++)
-        {
-            std::ostringstream X1;
-            std::ostringstream X2;
-            X1 << std::hex << std::setw(8) << std::setfill('0') << List[i].SOFunc;
-            X2 << std::hex << std::setw(8) << std::setfill('0') << List[i].EOFunc;
-            cout << List[i].func_name << "\t<" << X1.str() << ", " << X2.str() << ">" << endl;
-        }
+        info.EOFunc = 0x7FFFFFFC;
+        List.push_back(info);
+        cout << "  " << List.size() << " symbols loaded." << endl;
     }
 
+    //---------------------------------------------------------
+    // 2) Walk the retirement trace, classifying each event
+    //---------------------------------------------------------
+    regex I_pattern("^I ([0-9a-fA-F]{8})@([0-9]+) ([0-9a-fA-F]{8})");
+    regex X_pattern("^X ([0-9a-fA-F]{8})@([0-9]+) ([0-9a-fA-F]{2})");
+    smatch m;
+    string a_line;
 
-    cout << "Analizing Log file ..." << endl;
-    cout << "Tracing Program Counter ..." << endl;
-    regex Trac_pattern("^([0-9a-fA-F]{8})@([0-9]*)");
-    cntr = 0;
-    int ecntr(0);
-    int correct(0);
-    int PC(0);
-    bool found(false);
-    std::vector<func_info> call_stack;
+    vector<Frame> call_stack;
+    // When true, the *next* committed instruction's function should
+    // be pushed as a new frame of `pending_kind` (used for both
+    // real calls and interrupt/exception entry, since in both cases
+    // we only learn the callee's identity once we see its PC).
+    bool      pending_push = false;
+    FrameKind pending_kind = FrameKind::CALL;
+
+    int cntr = 0, ecntr = 0, correct = 0;
+
+    cout << "Elaborating trace..." << endl;
     while (trac_log.is_open() && !trac_log.eof())
     {
         cntr++;
-        if (cntr % 100 == 0)
-        {
-            cout << "\033[2K\r" << std::flush;
-            cout << "line #" << cntr;
-        }
         getline(trac_log, a_line);
-        if (verbose)
-            cout << "line #" << cntr << ":\t" << a_line << endl;
-
         if (a_line.empty())
-        {
-            correct++;
             continue;
-        }
 
-        if (!regex_search(a_line, m, Trac_pattern))
+        if (regex_search(a_line, m, I_pattern))
         {
-            ecntr++;
-            Erro_fil << a_line << endl;
-            if (verbose)
-                cout << "Skipping malformed log line: " << a_line << endl;
-            continue;
-        }
+            unsigned int pc   = hex2uint(m.str(1));
+            string       time = m.str(2);
+            uint32_t     op   = (uint32_t)hex2uint(m.str(3));
 
-        PC = static_cast<int>(hex2uint(m.str(1)));
-        string time = m.str(2);
-        found = find_func(List, static_cast<unsigned int>(PC), info);
-        if (!found)
-        {
-            ecntr++;
-            Erro_fil << a_line << endl;
-            if (verbose)
-                cout << "Skipping unmapped PC: " << a_line << endl;
-            continue;
-        }
-
-        if (call_stack.empty())
-        {
-            call_stack.push_back(info);
-            emit_stack_state(trac_vis, m.str(1), time, call_stack);
-            if (verbose)
-                emit_stack_state(cout, m.str(1), time, call_stack);
-            correct++;
-            continue;
-        }
-
-        std::size_t matched = call_stack.size();
-        for (std::size_t i = call_stack.size(); i-- > 0;)
-        {
-            if ((call_stack[i].SOFunc == info.SOFunc) && (call_stack[i].EOFunc == info.EOFunc) &&
-                (call_stack[i].func_name == info.func_name))
+            func_info info;
+            bool found = find_func(List, pc, info);
+            if (!found)
             {
-                matched = i;
-                break;
-            }
-        }
-
-        if (matched < call_stack.size())
-        {
-            if (matched + 1 == call_stack.size())
-            {
-                correct++;
+                ecntr++;
+                Erro_fil << a_line << "  (unmapped PC)\n";
                 continue;
             }
-            if (matched + 1 < call_stack.size())
-                call_stack.erase(call_stack.begin() + matched + 1, call_stack.end());
-            emit_stack_state(trac_vis, m.str(1), time, call_stack);
-            if (verbose)
-                emit_stack_state(cout, m.str(1), time, call_stack);
-            correct++;
-            continue;
-        }
 
-        call_stack.push_back(info);
-        emit_stack_state(trac_vis, m.str(1), time, call_stack);
-        if (verbose)
-            emit_stack_state(cout, m.str(1), time, call_stack);
-        correct++;
+            // A call or an exception/interrupt entry is pending from
+            // the previous event: this PC is the callee/handler.
+            if (pending_push)
+            {
+                call_stack.push_back(Frame{info, pending_kind});
+                pending_push = false;
+                emit_stack_state(trac_vis, m.str(1), time, call_stack);
+                if (verbose) emit_stack_state(cout, m.str(1), time, call_stack);
+            }
+            else if (call_stack.empty())
+            {
+                call_stack.push_back(Frame{info, FrameKind::ROOT});
+                emit_stack_state(trac_vis, m.str(1), time, call_stack);
+                if (verbose) emit_stack_state(cout, m.str(1), time, call_stack);
+            }
+            else if (info.func_name != call_stack.back().info.func_name)
+            {
+                // Landed in a different function without a saved
+                // return address (tail-jump / fallthrough into an
+                // adjacent routine): relabel current frame in place,
+                // depth unchanged.
+                call_stack.back().info = info;
+                emit_stack_state(trac_vis, m.str(1), time, call_stack);
+                if (verbose) emit_stack_state(cout, m.str(1), time, call_stack);
+            }
+            // else: same function, same frame - normal sequential
+            // execution, nothing to report (matches original tool's
+            // "correct++, continue" behaviour).
+
+            correct++;
+
+            // Now decide what *this* instruction implies for the
+            // frame that will be active on the *next* commit.
+            if (is_eret(op))
+            {
+                // Returning from trap/interrupt.
+                if (!call_stack.empty())
+                    call_stack.pop_back();
+            }
+            else if (is_ret(op))
+            {
+                // Returning from an ordinary call.
+                if (!call_stack.empty())
+                    call_stack.pop_back();
+            }
+            else if (is_call(op))
+            {
+                pending_push = true;
+                pending_kind = FrameKind::CALL;
+            }
+        }
+        else if (regex_search(a_line, m, X_pattern))
+        {
+            // Interrupt/exception taken. The handler's identity is
+            // only known once we see its first committed PC, so just
+            // arm a pending push; the interrupted PC is only useful
+            // for diagnostics here.
+            pending_push = true;
+            pending_kind = FrameKind::IRQ;
+            correct++;
+        }
+        else
+        {
+            ecntr++;
+            Erro_fil << a_line << "  (malformed line)\n";
+        }
     }
 
-    cout << "\033[2K\r" << std::flush;
     cout << "line #" << cntr << endl;
-    cout << "error= " << ecntr << endl;
-    cout << "correct= " << correct << endl;
-    cout << "Tracing is done!" << endl << endl;
+    cout << "errors  = " << ecntr << endl;
+    cout << "correct = " << correct << endl;
+    cout << "Tracing is done!" << endl;
+
     trac_log.close();
     trac_vis.close();
     Erro_fil.close();
 
-    cout << "ALL DONE!" << endl;
-
     return 0;
 }
-
-
-
