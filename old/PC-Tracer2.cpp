@@ -170,20 +170,10 @@ int main(int argc, char **argv)
             getline(code_fil, a_line);
             if (regex_search(a_line, m, Code_pattern))
             {
-                // NOTE: earlier versions rounded `tmp` to an 8-byte
-                // boundary and additionally subtracted 8, which was a
-                // workaround for a *fetch-stage* tracer whose PC was
-                // only reported at 8-byte (2-instruction) granularity.
-                // biriscv_pc_tracer2 logs the exact, writeback-stage
-                // PC, which is already correct to 4 bytes, so no such
-                // rounding is needed - and doing it anyway carved an
-                // 8-byte dead zone right before every function's
-                // start, silently discarding each *previous* function's
-                // last instruction(s) (almost always its `ret`). Ranges
-                // are now perfectly contiguous: function N ends exactly
-                // one instruction before function N+1 starts.
                 unsigned int tmp = hex2uint(m.str(1));
-                info.EOFunc = tmp - 4;
+                bool modif = false;
+                if ((tmp % 8) != 0) { modif = true; tmp -= 4; }
+                info.EOFunc = tmp - (!modif) * 8;
                 List.push_back(info);
                 info.func_name = m.str(2);
                 info.SOFunc = tmp;
@@ -230,19 +220,9 @@ int main(int argc, char **argv)
             bool found = find_func(List, pc, info);
             if (!found)
             {
-                // IMPORTANT: do NOT `continue` here. Symbol-table gaps
-                // are a display-only problem (the function name is
-                // unknown) and must never be allowed to skip the
-                // is_call/is_ret/is_eret classification below - doing
-                // so silently drops pops, which is what previously
-                // turned every unmapped `ret` into a permanent stack
-                // leak (the "never-ending slope"). Worst case with
-                // this fallback is a frame labelled "??".
                 ecntr++;
                 Erro_fil << a_line << "  (unmapped PC)\n";
-                info.func_name = "??";
-                info.SOFunc = pc;
-                info.EOFunc = pc;
+                continue;
             }
 
             // A call or an exception/interrupt entry is pending from
