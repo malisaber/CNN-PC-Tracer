@@ -108,34 +108,26 @@ static inline bool is_ret(uint32_t op)
 }
 
 //-----------------------------------------------------------------
-// Call-stack context
-//
-// Each interrupt/exception gets its own independent call stack
-// (a "Context"), separate from whatever the main flow (or an outer
-// interrupt, for nested IRQs) was doing. The interrupted context is
-// simply left untouched on a context stack while the handler's
-// context runs; on xRET the handler's whole context is discarded
-// and the previous one resumes exactly where it left off. Every
-// frame belonging to an interrupt context - not just its top -
-// carries the [IRQ] tag, since is_irq is a property of the context,
-// not of an individual frame.
+// Call-stack frame
 //-----------------------------------------------------------------
-struct Context
+enum class FrameKind { ROOT, CALL, IRQ };
+
+struct Frame
 {
-    vector<func_info> stack;
-    bool               is_irq = false;
+    func_info info;
+    FrameKind kind = FrameKind::CALL;
 };
 
 static void emit_stack_state(ostream &out, const string &pc, const string &time,
-                              const Context &ctx)
+                              const vector<Frame> &stack)
 {
     out << "(" << pc << " @ " << setw(8) << time << ")" << "\t\t";
-    for (size_t i = 1; i < ctx.stack.size(); ++i)
+    for (size_t i = 1; i < stack.size(); ++i)
         out << "\t";
-    if (ctx.is_irq)
+    if (!stack.empty() && stack.back().kind == FrameKind::IRQ)
         out << "[IRQ] ";
-    if (!ctx.stack.empty())
-        out << ctx.stack.back().func_name << '\n';
+    if (!stack.empty())
+        out << stack.back().info.func_name << '\n';
     else
         out << "<empty>\n";
 }
@@ -210,16 +202,13 @@ int main(int argc, char **argv)
     smatch m;
     string a_line;
 
-    vector<Context> contexts;
-    contexts.push_back(Context{});   // context[0] = main flow, is_irq=false
-
-    // What the *next* committed instruction implies for the currently
-    // active context:
-    //   NONE - just a normal instruction, no stack action pending
-    //   CALL - push a new frame onto the *current* context's stack
-    //   IRQ  - push a brand-new, separate context (its own stack)
-    enum class Pending { NONE, CALL, IRQ };
-    Pending pending = Pending::NONE;
+    vector<Frame> call_stack;
+    // When true, the *next* committed instruction's function should
+    // be pushed as a new frame of `pending_kind` (used for both
+    // real calls and interrupt/exception entry, since in both cases
+    // we only learn the callee's identity once we see its PC).
+    bool      pending_push = false;
+    FrameKind pending_kind = FrameKind::CALL;
 
     int cntr = 0, ecntr = 0, correct = 0;
 
@@ -256,90 +245,65 @@ int main(int argc, char **argv)
                 info.EOFunc = pc;
             }
 
-            Context &cur = contexts.back();
-
-            if (pending == Pending::IRQ)
+            // A call or an exception/interrupt entry is pending from
+            // the previous event: this PC is the callee/handler.
+            if (pending_push)
             {
-                // Freeze whatever context was running and start a
-                // brand-new, independent one for the handler. Nested
-                // interrupts just stack another fresh context on top
-                // the same way.
-                contexts.push_back(Context{ {info}, true });
-                pending = Pending::NONE;
-                emit_stack_state(trac_vis, m.str(1), time, contexts.back());
-                if (verbose) emit_stack_state(cout, m.str(1), time, contexts.back());
+                call_stack.push_back(Frame{info, pending_kind});
+                pending_push = false;
+                emit_stack_state(trac_vis, m.str(1), time, call_stack);
+                if (verbose) emit_stack_state(cout, m.str(1), time, call_stack);
             }
-            else if (pending == Pending::CALL)
+            else if (call_stack.empty())
             {
-                cur.stack.push_back(info);
-                pending = Pending::NONE;
-                emit_stack_state(trac_vis, m.str(1), time, cur);
-                if (verbose) emit_stack_state(cout, m.str(1), time, cur);
+                call_stack.push_back(Frame{info, FrameKind::ROOT});
+                emit_stack_state(trac_vis, m.str(1), time, call_stack);
+                if (verbose) emit_stack_state(cout, m.str(1), time, call_stack);
             }
-            else if (cur.stack.empty())
-            {
-                cur.stack.push_back(info);
-                emit_stack_state(trac_vis, m.str(1), time, cur);
-                if (verbose) emit_stack_state(cout, m.str(1), time, cur);
-            }
-            else if (info.func_name != cur.stack.back().func_name)
+            else if (info.func_name != call_stack.back().info.func_name)
             {
                 // Landed in a different function without a saved
                 // return address (tail-jump / fallthrough into an
                 // adjacent routine): relabel current frame in place,
                 // depth unchanged.
-                cur.stack.back() = info;
-                emit_stack_state(trac_vis, m.str(1), time, cur);
-                if (verbose) emit_stack_state(cout, m.str(1), time, cur);
+                call_stack.back().info = info;
+                emit_stack_state(trac_vis, m.str(1), time, call_stack);
+                if (verbose) emit_stack_state(cout, m.str(1), time, call_stack);
             }
             // else: same function, same frame - normal sequential
-            // execution, nothing to report.
+            // execution, nothing to report (matches original tool's
+            // "correct++, continue" behaviour).
 
             correct++;
 
-            // Now decide what *this* instruction implies for what
-            // will be active on the *next* commit. Re-fetch the
-            // active context, since an IRQ push above may have
-            // changed which one that is.
-            Context &active = contexts.back();
-
+            // Now decide what *this* instruction implies for the
+            // frame that will be active on the *next* commit.
             if (is_eret(op))
             {
-                // Return from trap/interrupt: discard the *entire*
-                // handler context (its call stack is not carried
-                // over - it's gone, by design) and resume whichever
-                // context was running before it, exactly as it was
-                // left.
-                if (contexts.size() > 1)
-                    contexts.pop_back();
-                else
-                {
-                    // xRET while not actually inside a tracked
-                    // interrupt context - likely a spurious/boot-time
-                    // mret. Don't crash the stack; note it and treat
-                    // it like an ordinary return in the main context.
-                    Erro_fil << a_line << "  (xRET with no matching interrupt context)\n";
-                    if (!active.stack.empty())
-                        active.stack.pop_back();
-                }
+                // Returning from trap/interrupt.
+                if (!call_stack.empty())
+                    call_stack.pop_back();
             }
             else if (is_ret(op))
             {
-                if (!active.stack.empty())
-                    active.stack.pop_back();
+                // Returning from an ordinary call.
+                if (!call_stack.empty())
+                    call_stack.pop_back();
             }
             else if (is_call(op))
             {
-                pending = Pending::CALL;
+                pending_push = true;
+                pending_kind = FrameKind::CALL;
             }
         }
         else if (regex_search(a_line, m, X_pattern))
         {
             // Interrupt/exception taken. The handler's identity is
             // only known once we see its first committed PC, so just
-            // arm a pending context push; the interrupted PC is only
-            // useful for diagnostics here.
-            pending = Pending::IRQ;
+            // arm a pending push; the interrupted PC is only useful
+            // for diagnostics here.
+            pending_push = true;
+            pending_kind = FrameKind::IRQ;
             correct++;
         }
         else
