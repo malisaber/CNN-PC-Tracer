@@ -335,23 +335,11 @@ int main(int argc, char **argv)
         }
         else if (regex_search(a_line, m, X_pattern))
         {
-            uint32_t cause = (uint32_t)hex2uint(m.str(3));
-
-            // Genuine trap entries only (misaligned/illegal/ecall/
-            // page-fault/interrupt, cause < 0x30). mret/sret/uret
-            // (0x30-0x33) and fence/sfence/satp (0x34) also drive a
-            // nonzero exception code on real hardware - that's just
-            // the CSR unit's flush request for an instruction that
-            // already produced its own, perfectly normal 'I' record
-            // (decoded directly via is_eret() above). Treating those
-            // as a new interrupt-entry here would re-arm a pending
-            // IRQ push right after the real pop already happened,
-            // permanently mislabeling every instruction after a
-            // return as still being inside the interrupt - exactly
-            // the "everything after mret becomes [IRQ] forever" bug.
-            if (cause < 0x30)
-                pending = Pending::IRQ;
-
+            // Interrupt/exception taken. The handler's identity is
+            // only known once we see its first committed PC, so just
+            // arm a pending context push; the interrupted PC is only
+            // useful for diagnostics here.
+            pending = Pending::IRQ;
             correct++;
         }
         else
